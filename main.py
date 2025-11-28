@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 import os
-from typing import List, Sequence
 
 from fastapi import FastAPI, HTTPException
 
 from embedder import ResumeEmbedder
+from graph import build_add_resume_graph, build_recommendation_graph
 from models import (
     RecommendationRequest,
     RecommendationResponse,
-    RecommendationResult,
     Resume,
     ResumeListResponse,
 )
+from llm import ResumeLLM
+from reranker import RecommendationRanker
 from vectorstore import ResumeVectorStore
 
 
@@ -22,6 +23,10 @@ PERSIST_DIRECTORY = os.path.join(os.path.dirname(__file__), "chroma_storage")
 app = FastAPI(title=APP_NAME, version="1.0.0")
 embedder = ResumeEmbedder()
 vector_store = ResumeVectorStore(persist_directory=PERSIST_DIRECTORY)
+resume_llm = ResumeLLM()
+ranker = RecommendationRanker()
+add_resume_graph = build_add_resume_graph(embedder, vector_store)
+recommendation_graph = build_recommendation_graph(embedder, vector_store, ranker)
 
 
 @app.get("/health")
@@ -31,10 +36,9 @@ async def health() -> dict:
 
 @app.post("/add_resume")
 async def add_resume(resume: Resume) -> dict:
-    document = vector_store.build_document(resume)
-    embedding = embedder.embed_text(document)
-    vector_store.add_resume(resume, embedding, document)
-    return {"status": "created", "id": resume.id}
+    enriched = _ensure_resume_fields(resume)
+    add_resume_graph.invoke({"resume": enriched})
+    return {"status": "created", "id": enriched.id}
 
 
 @app.get("/resumes", response_model=ResumeListResponse)
@@ -43,20 +47,23 @@ async def list_resumes() -> ResumeListResponse:
     return ResumeListResponse(resumes=resumes)
 
 
+@app.delete("/resumes/{resume_id}")
+async def delete_resume(resume_id: str) -> dict:
+    deleted = vector_store.delete(resume_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Resume not found")
+    return {"status": "deleted", "id": resume_id}
+
+
 @app.post("/recommend", response_model=RecommendationResponse)
 async def recommend_teammate(request: RecommendationRequest) -> RecommendationResponse:
-    all_resumes = vector_store.get_all_resumes()
-    if not all_resumes:
+    if not vector_store.has_resumes():
         raise HTTPException(status_code=404, detail="No resumes stored")
 
-    query_text = vector_store.build_query_text(request)
-    query_embedding = embedder.embed_text(query_text)
-    candidates = vector_store.query(query_embedding, top_k=request.top_k)
-
-    if not candidates:
+    state = recommendation_graph.invoke({"request": request})
+    ranked = state.get("ranked", [])
+    if not ranked:
         raise HTTPException(status_code=404, detail="No matching candidates")
-
-    ranked = _rerank_candidates(candidates, request)
     best = ranked[0]
     response = RecommendationResponse(
         best_match=best,
@@ -65,38 +72,40 @@ async def recommend_teammate(request: RecommendationRequest) -> RecommendationRe
     return response
 
 
-def _rerank_candidates(
-    candidates: Sequence[tuple[Resume, float]], request: RecommendationRequest
-) -> List[RecommendationResult]:
-    request_skill_set = {skill.lower().strip() for skill in request.skills if skill.strip()}
-    ranked: List[RecommendationResult] = []
+def _ensure_resume_fields(resume: Resume) -> Resume:
+    needs_role = not (resume.role and resume.role.strip())
+    needs_skills = len(resume.skills) == 0
 
-    for resume, similarity in candidates:
-        candidate_skills = {skill.lower().strip(): skill for skill in resume.skills}
-        matches = [cand for key, cand in candidate_skills.items() if key in request_skill_set]
-        skill_score = (len(matches) / max(len(request_skill_set), 1)) if request_skill_set else 0
-        role_score = 1.0 if resume.role.lower() == request.role.lower() else 0
-        final_score = (similarity * 0.6) + (skill_score * 0.3) + (role_score * 0.1)
-        explanation = _build_explanation(resume, final_score, matches, role_score)
-        ranked.append(
-            RecommendationResult(
-                candidate=resume,
-                match_score=round(final_score, 4),
-                matching_skills=matches,
-                explanation=explanation,
-            )
-        )
+    if not needs_role and not needs_skills:
+        return resume
 
-    ranked.sort(key=lambda result: result.match_score, reverse=True)
-    return ranked
+    inference_text = "\n".join(part for part in [resume.experience, resume.summary] if part)
+    inferred_role, inferred_skills = resume_llm.infer_role_and_skills(inference_text)
+
+    update: dict = {}
+    if needs_role:
+        update["role"] = inferred_role or "Hackathon Contributor"
+    if needs_skills:
+        update["skills"] = _deduplicate_skills(inferred_skills) or ["teamwork"]
+
+    enriched = resume.model_copy(update=update)
+    if not enriched.role:
+        enriched = enriched.model_copy(update={"role": "Hackathon Contributor"})
+    if not enriched.skills:
+        enriched = enriched.model_copy(update={"skills": ["teamwork"]})
+    return enriched
 
 
-def _build_explanation(
-    resume: Resume, score: float, matches: List[str], role_score: float
-) -> str:
-    parts = [
-        f"Score {score:.2f}",
-        f"role match: {'exact' if role_score == 1 else 'different'}",
-        f"skill overlap: {', '.join(matches) if matches else 'none'}",
-    ]
-    return "; ".join(parts)
+def _deduplicate_skills(skills: list[str]) -> list[str]:
+    seen = set()
+    cleaned = []
+    for skill in skills or []:
+        text = skill.strip()
+        if not text:
+            continue
+        lowered = text.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        cleaned.append(text)
+    return cleaned[:10]

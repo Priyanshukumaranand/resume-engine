@@ -6,3 +6,5 @@ pydantic>=2.4.0
 streamlit>=1.31.0
 requests>=2.31.0
 torch>=2.1.0
+pypdf>=4.0.0
+langgraph>=0.2.35

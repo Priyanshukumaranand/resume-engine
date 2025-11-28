@@ -23,6 +23,7 @@ class ResumeVectorStore:
     def _metadata_from_resume(self, resume: Resume) -> dict:
         metadata = resume.model_dump()
         metadata["skills"] = json.dumps(resume.skills)
+        metadata["role"] = resume.role or ""
         return metadata
 
     def _resume_from_metadata(self, metadata: dict) -> Resume:
@@ -32,7 +33,7 @@ class ResumeVectorStore:
             id=str(metadata["id"]),
             name=metadata["name"],
             email=metadata["email"],
-            role=metadata["role"],
+            role=metadata.get("role") or None,
             skills=skills,
             experience=metadata["experience"],
             summary=metadata["summary"],
@@ -52,6 +53,13 @@ class ResumeVectorStore:
             return []
         return [self._resume_from_metadata(metadata) for metadata in result["metadatas"]]
 
+    def has_resumes(self) -> bool:
+        try:
+            return self._collection.count() > 0
+        except AttributeError:
+            result = self._collection.get(limit=1)
+            return bool(result.get("ids")) if result else False
+
     def query(self, embedding: Sequence[float], top_k: int) -> List[tuple[Resume, float]]:
         query_result = self._collection.query(
             query_embeddings=[list(embedding)],
@@ -69,23 +77,31 @@ class ResumeVectorStore:
             candidates.append((resume, similarity))
         return candidates
 
+    def delete(self, resume_id: str) -> bool:
+        if not resume_id:
+            return False
+        existing = self._collection.get(ids=[resume_id])
+        ids = existing.get("ids") if existing else None
+        if not ids:
+            return False
+        self._collection.delete(ids=[resume_id])
+        return True
+
     @staticmethod
     def build_document(resume: Resume) -> str:
-        return "\n".join(
-            [
-                resume.role,
-                ", ".join(resume.skills),
-                resume.experience,
-                resume.summary,
-            ]
-        )
+        parts = [
+            resume.role or "",
+            ", ".join(resume.skills) if resume.skills else "",
+            resume.experience,
+            resume.summary,
+        ]
+        return "\n".join(part for part in parts if part).strip()
 
     @staticmethod
     def build_query_text(request: RecommendationRequest) -> str:
-        return "\n".join(
-            [
-                request.role,
-                ", ".join(request.skills),
-                request.summary,
-            ]
-        )
+        parts = [
+            request.role,
+            ", ".join(request.skills) if request.skills else "",
+            request.summary,
+        ]
+        return "\n".join(part for part in parts if part).strip()
