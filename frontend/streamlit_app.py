@@ -6,13 +6,31 @@ from uuid import uuid4
 
 import requests
 import streamlit as st
-from pypdf import PdfReader
+
+# Try to import a PDF reader backend. Prefer pypdf, fall back to PyPDF2.
+try:
+    from pypdf import PdfReader  # preferred
+    _PDF_BACKEND = "pypdf"
+except Exception:
+    try:
+        from PyPDF2 import PdfReader  # fallback
+        _PDF_BACKEND = "PyPDF2"
+    except Exception:
+        PdfReader = None  # type: ignore
+        _PDF_BACKEND = None
 
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
 
 st.set_page_config(page_title="Hackathon Teammate Finder", layout="wide")
 st.title("Hackathon Teammate Finder Demo")
 st.caption(f"Talking to API at {API_BASE_URL}")
+
+if _PDF_BACKEND is None:
+    st.warning(
+        "PDF extraction support is not available because neither 'pypdf' nor 'PyPDF2' is installed. "
+        "Upload/extraction of PDF resumes will fail. To fix, add 'pypdf' to your environment (e.g. "
+        "`pip install pypdf`) or add it to your requirements.txt and redeploy."
+    )
 
 
 def _post(path: str, payload: dict) -> Any:
@@ -36,8 +54,15 @@ def _delete(path: str) -> Any:
 def _extract_text_from_pdf(uploaded_file) -> str:
     if uploaded_file is None:
         raise ValueError("No PDF supplied")
+    if PdfReader is None:
+        # Fail with a helpful message when PDF support is actually needed.
+        raise RuntimeError(
+            "PDF extraction library not available. Install 'pypdf' (recommended) by running "
+            "`pip install pypdf` or add 'pypdf' to your requirements and redeploy."
+        )
     uploaded_file.seek(0)
     reader = PdfReader(uploaded_file)
+    # Both pypdf and PyPDF2 expose .pages and page.extract_text() in recent versions.
     pages = [page.extract_text() or "" for page in reader.pages]
     text = "\n".join(pages).strip()
     if not text:
@@ -68,7 +93,7 @@ with st.expander("Add resume", expanded=True):
                     height=200,
                     disabled=True,
                 )
-            except ValueError as exc:
+            except (ValueError, RuntimeError) as exc:
                 st.error(str(exc))
 
         submitted = st.form_submit_button("Store resume")
@@ -79,7 +104,7 @@ with st.expander("Add resume", expanded=True):
                 st.stop()
             try:
                 full_text = extracted_text_preview or _extract_text_from_pdf(pdf_file)
-            except ValueError as exc:
+            except (ValueError, RuntimeError) as exc:
                 st.error(str(exc))
                 st.stop()
 
