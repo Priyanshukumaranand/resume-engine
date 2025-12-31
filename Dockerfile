@@ -27,7 +27,6 @@ COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/pytho
 COPY --from=builder /usr/local/bin /usr/local/bin
 
 COPY backend ./backend
-COPY categories.json ./
 
 RUN mkdir -p /app/chroma_storage
 VOLUME ["/app/chroma_storage"]
