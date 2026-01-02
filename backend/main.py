@@ -197,8 +197,8 @@ async def answer_question(request: QARequest) -> QAResponse:
     Evidence-based QA with improved search.
     
     Features:
+    - Query expansion for better section matching
     - Answers based on retrieved context
-    - Lowered confidence threshold for better response rate
     - Falls back to rule-based answer when LLM fails
     - Source sections and evidence snippets included
     """
@@ -206,10 +206,22 @@ async def answer_question(request: QARequest) -> QAResponse:
         raise HTTPException(status_code=404, detail="No resumes stored")
 
     question = request.question.strip()
+    question_lower = question.lower()
+    
+    # Query expansion - add relevant section keywords based on question type
+    expanded_query = question
+    if any(word in question_lower for word in ["skill", "technology", "tech", "know", "language", "framework"]):
+        expanded_query = f"{question} Technical Skills Programming Languages ML AI"
+    elif any(word in question_lower for word in ["project", "built", "created", "developed", "made"]):
+        expanded_query = f"{question} Projects Key Projects developed built"
+    elif any(word in question_lower for word in ["experience", "work", "job", "role", "intern"]):
+        expanded_query = f"{question} Experience Work History internship"
+    elif any(word in question_lower for word in ["education", "degree", "university", "college"]):
+        expanded_query = f"{question} Education University B.Tech degree"
     
     # Increase top_k for better coverage
     effective_top_k = max(request.top_k, 5)
-    query_embedding = embedder.embed_text(question)
+    query_embedding = embedder.embed_text(expanded_query)
     
     # Get candidates with section metadata
     candidates = vector_store.query(query_embedding, top_k=effective_top_k)
@@ -385,7 +397,7 @@ def _build_qa_context(matches: List[QAMatch], limit: int = 5) -> str:
 
 
 def _build_rule_based_answer(question: str, matches: List[QAMatch]) -> str:
-    """Build a rule-based answer from matched resumes."""
+    """Build a rule-based answer from matched resumes and chunks."""
     if not matches:
         return ""
 
@@ -404,42 +416,80 @@ def _build_rule_based_answer(question: str, matches: List[QAMatch]) -> str:
     
     top = unique_matches[0]
     resume = top.resume
+    chunk = top.chunk or ""
+    
+    # Helper to extract section from chunk text
+    def _extract_section(chunk: str, section_name: str) -> str:
+        """Extract content after a section header from chunk."""
+        import re
+        patterns = [
+            rf'{section_name}[:\s]*\n([^\n]+(?:\n(?![A-Z][a-z]+:)[^\n]+)*)',
+            rf'{section_name}\s*([^\n]+)',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, chunk, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()[:400]
+        return ""
     
     # Build answer based on question type
-    if any(word in question_lower for word in ["experience", "work", "job", "role"]):
+    if any(word in question_lower for word in ["experience", "work", "job", "role", "intern"]):
+        # Look for experience section in chunk
+        exp_text = _extract_section(chunk, "Experience") or _extract_section(chunk, "Work")
+        if exp_text:
+            return f"{resume.name}'s experience: {exp_text}"
         exp = resume.experience[:400] if resume.experience else resume.summary[:400]
         return f"{resume.name} has the following experience: {exp}"
     
-    elif any(word in question_lower for word in ["skill", "technology", "tech", "know"]):
+    elif any(word in question_lower for word in ["skill", "technology", "tech", "know", "language"]):
+        # Look for skills section in chunk
+        skills_text = _extract_section(chunk, "Skills") or _extract_section(chunk, "Technical Skills")
+        if skills_text:
+            return f"{resume.name}'s skills: {skills_text}"
         if resume.skills:
             return f"{resume.name} has these skills: {', '.join(resume.skills)}"
-        else:
-            return f"Based on {resume.name}'s resume: {resume.summary[:300]}"
+        # Fall back to chunk which likely contains skills
+        return f"From {resume.name}'s resume: {chunk[:400]}"
     
-    elif any(word in question_lower for word in ["project", "built", "created", "developed"]):
+    elif any(word in question_lower for word in ["project", "built", "created", "developed", "made"]):
+        # Look for projects section in chunk
+        projects_text = _extract_section(chunk, "Projects") or _extract_section(chunk, "Key Projects")
+        if projects_text:
+            return f"{resume.name}'s projects: {projects_text}"
         if resume.projects:
             return f"{resume.name} has worked on these projects: {', '.join(resume.projects)}"
-        else:
-            return f"From {resume.name}'s experience: {resume.experience[:300] if resume.experience else resume.summary[:300]}"
+        # Search all chunks for project mentions
+        for m in unique_matches:
+            if "project" in m.chunk.lower():
+                proj_text = _extract_section(m.chunk, "Projects")
+                if proj_text:
+                    return f"{m.resume.name}'s projects: {proj_text}"
+                # Return project-related portion of chunk
+                return f"{m.resume.name}'s projects: {m.chunk[:400]}"
+        return f"From {resume.name}'s experience: {chunk[:400]}"
     
     elif any(word in question_lower for word in ["education", "degree", "university", "college", "study"]):
+        edu_text = _extract_section(chunk, "Education")
+        if edu_text:
+            return f"{resume.name}'s education: {edu_text}"
         if resume.education:
             return f"{resume.name}'s education: {resume.education}"
-        else:
-            return f"Education information for {resume.name} is not explicitly listed."
+        return f"Education information for {resume.name}: {chunk[:300]}"
     
-    elif any(word in question_lower for word in ["who", "find", "candidate"]):
-        # General candidate search
+    elif any(word in question_lower for word in ["who", "find", "candidate", "top", "best"]):
+        # General candidate search - provide comprehensive info
         parts = [f"{resume.name}"]
         if resume.role:
             parts.append(f"({resume.role})")
-        if resume.skills:
+        # Extract skills from chunk if not in resume
+        skills_text = _extract_section(chunk, "Skills")
+        if skills_text:
+            parts.append(f"with {skills_text[:100]}")
+        elif resume.skills:
             parts.append(f"with skills in {', '.join(resume.skills[:5])}")
-        return f"Best match: {' '.join(parts)}. {resume.summary[:200] if resume.summary else ''}"
+        return f"Best match: {' '.join(parts)}. {chunk[:200]}"
     
     else:
-        # Default: return summary
+        # Default: return chunk content which has full context
         role = resume.role or "professional"
-        skills = ", ".join(resume.skills[:5]) if resume.skills else "various skills"
-        summary = resume.summary[:250] if resume.summary else resume.experience[:250]
-        return f"{resume.name} is a {role} with {skills}. {summary}"
+        return f"{resume.name} ({role}): {chunk[:400]}"

@@ -193,7 +193,7 @@ def build_add_resume_graph(embedder: ResumeEmbedder, store: ResumeVectorStore):
     graph = StateGraph(AddResumeState)
 
     def detect_and_chunk(state: AddResumeState):
-        """Detect sections and create section-aware chunks."""
+        """Detect sections and create section-aware chunks with candidate context."""
         resume = state["resume"]
         raw_text = resume.raw_text or _combine_fields(resume)
         
@@ -203,8 +203,14 @@ def build_add_resume_graph(embedder: ResumeEmbedder, store: ResumeVectorStore):
         # Create section-aware chunks
         section_chunks = chunk_by_section(raw_text, sections)
         
-        # Also create flat chunk list for backward compatibility
-        chunks = [sc.text for sc in section_chunks]
+        # Prepend candidate context to each chunk (Parent Document Retrieval)
+        # This helps the LLM identify which candidate each chunk belongs to
+        role_part = f" ({resume.role})" if resume.role else ""
+        skills_part = f" | Skills: {', '.join(resume.skills[:5])}" if resume.skills else ""
+        context_prefix = f"[Candidate: {resume.name}{role_part}{skills_part}]\n"
+        
+        # Create chunks with context
+        chunks = [context_prefix + sc.text for sc in section_chunks]
         
         return {
             "chunks": chunks,
@@ -287,7 +293,12 @@ def build_refresh_resume_graph(
         
         sections = detect_sections(raw_text)
         section_chunks = chunk_by_section(raw_text, sections)
-        chunks = [sc.text for sc in section_chunks]
+        
+        # Prepend candidate context to each chunk
+        role_part = f" ({resume.role})" if resume.role else ""
+        skills_part = f" | Skills: {', '.join(resume.skills[:5])}" if resume.skills else ""
+        context_prefix = f"[Candidate: {resume.name}{role_part}{skills_part}]\n"
+        chunks = [context_prefix + sc.text for sc in section_chunks]
         
         return {
             "chunks": chunks,

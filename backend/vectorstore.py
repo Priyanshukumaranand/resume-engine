@@ -48,7 +48,10 @@ class ResumeVectorStore:
         chunk_index: int,
         section_type: str = "unknown",
     ) -> dict:
-        """Create metadata dict for a chunk."""
+        """Create metadata dict for a chunk with enhanced filtering support."""
+        # Create searchable skills text for metadata filtering
+        skills_text = ", ".join(resume.skills).lower() if resume.skills else ""
+        
         metadata = {
             "id": resume.id,
             "anon_id": resume.anon_id,
@@ -57,10 +60,11 @@ class ResumeVectorStore:
             "email": resume.email,
             "role": resume.role or "",
             "skills": json.dumps(resume.skills),
+            "skills_text": skills_text,  # For text-based filtering
             "projects": json.dumps(resume.projects),
             "education": resume.education or "",
-            "experience": resume.experience[:500] if resume.experience else "",
-            "summary": resume.summary[:500] if resume.summary else "",
+            "experience": resume.experience[:800] if resume.experience else "",
+            "summary": resume.summary[:800] if resume.summary else "",
             "chunk_index": chunk_index,
             "section_type": section_type,
         }
@@ -166,13 +170,18 @@ class ResumeVectorStore:
         apply_section_weights: bool = True,
     ) -> List[Tuple[Resume, str, float, str]]:
         """
-        Query for similar resumes with optional section weighting.
+        Query for similar resumes with parent document context.
+        
+        Improvements:
+        - Fetches 50 candidates for better coverage
+        - Prepends candidate name/role to chunks for context
+        - Deduplicates by resume ID to avoid single-candidate dominance
         
         Returns:
-            List of (Resume, chunk_text, weighted_similarity, section_type) tuples
+            List of (Resume, chunk_with_context, weighted_similarity, section_type) tuples
         """
-        # Retrieve more candidates for reranking
-        fetch_k = min(top_k * 3, 30)
+        # Retrieve many more candidates for better coverage
+        fetch_k = min(top_k * 10, 50)
         
         query_result = self._collection.query(
             query_embeddings=[list(embedding)],
@@ -182,7 +191,9 @@ class ResumeVectorStore:
         if not query_result.get("metadatas"):
             return []
         
-        candidates: List[Tuple[Resume, str, float, str]] = []
+        # Group candidates by resume ID for deduplication
+        resume_best_chunks: dict = {}  # resume_id -> (resume, chunk, similarity, section, skills_match)
+        
         metadatas = query_result["metadatas"][0]
         distances = query_result["distances"][0]
         documents = query_result.get("documents", [[]])[0]
@@ -199,9 +210,22 @@ class ResumeVectorStore:
             else:
                 weighted_similarity = raw_similarity
             
-            candidates.append((resume, document, weighted_similarity, section_type))
+            # Prepend candidate context to chunk (Parent Document Retrieval)
+            role_part = f" ({resume.role})" if resume.role else ""
+            skills_part = f" - Skills: {', '.join(resume.skills[:5])}" if resume.skills else ""
+            chunk_with_context = f"Candidate: {resume.name}{role_part}{skills_part}\n{document}"
+            
+            # Keep best chunk per resume (deduplication)
+            resume_id = resume.id
+            if resume_id not in resume_best_chunks:
+                resume_best_chunks[resume_id] = (resume, chunk_with_context, weighted_similarity, section_type)
+            else:
+                # Keep the chunk with higher similarity
+                if weighted_similarity > resume_best_chunks[resume_id][2]:
+                    resume_best_chunks[resume_id] = (resume, chunk_with_context, weighted_similarity, section_type)
         
-        # Sort by weighted similarity and return top_k
+        # Convert to list and sort by similarity
+        candidates = list(resume_best_chunks.values())
         candidates.sort(key=lambda x: x[2], reverse=True)
         return candidates[:top_k]
 
